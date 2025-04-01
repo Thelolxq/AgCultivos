@@ -1,29 +1,43 @@
 import pandas as pd
 import numpy as np
-# import matplotlib.pyplot as plt # Descomentar si se usa la gráfica
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import copy # Necesario para deepcopy en cruce/mutación de planes
 
 class AG:
 
-    def __init__(self, num_poblacion, num_generaciones, prob_mutacion, prob_crossover, num_elite, cantidad_agua_max, cantidad_fertilizante_max, cantidad_pesticida_max): # Renombrados para claridad
+    def __init__(self, num_poblacion, num_generaciones, prob_mutacion, prob_crossover,
+                 num_elite, num_parcelas, # NUEVO: Número de parcelas/slots en el plan
+                 total_agua_disponible, total_fertilizante_disponible, total_pesticida_disponible, # RENOMBRADO: Límites GLOBALES
+                 prob_mutar_cultivo_en_parcela=0.1): # Probabilidad de cambiar el cultivo en una parcela
         self.num_poblacion = num_poblacion
         self.num_generaciones = num_generaciones
-        self.prob_mutacion = prob_mutacion
+        self.prob_mutacion_cantidad = prob_mutacion # Probabilidad de mutar una cantidad (agua, fert, pest) en una parcela
+        self.prob_mutar_cultivo = prob_mutar_cultivo_en_parcela # Probabilidad de mutar el tipo de cultivo en una parcela
         self.prob_crossover = prob_crossover
         self.num_elite = num_elite
-        # Límites MÁXIMOS para la mutación (pueden ser diferentes a los máx del CSV)
-        self.cantidad_agua_max = cantidad_agua_max
-        self.cantidad_fertilizante_max = cantidad_fertilizante_max
-        self.cantidad_pesticida_max = cantidad_pesticida_max
+        self.num_parcelas = num_parcelas # Número de "slots" en el plan de cultivo
+
+        # Límites TOTALES disponibles para TODO el plan
+        self.total_agua_disponible = total_agua_disponible
+        self.total_fertilizante_disponible = total_fertilizante_disponible
+        self.total_pesticida_disponible = total_pesticida_disponible
+
         self.datos_csv = None
-        # Para normalización en la aptitud, calculados después de cargar CSV
+        # Máximos del CSV (para normalización individual de parcelas)
         self.max_agua_csv = 1
         self.max_fert_csv = 1
         self.max_pest_csv = 1
         self.max_costo_csv = 1
         self.max_prod_csv = 1
+        # Máximos teóricos del plan (para normalización del plan total) - Estimación simple
+        self.max_retorno_plan_estimado = 1
+        self.max_costo_plan_estimado = 1
+        self.max_prod_plan_estimado = 1
+
+
         self.mejor_aptitud_historial = []
+        self.mejor_plan_global = None # Para almacenar el mejor plan encontrado en todas las generaciones
 
     def load_csv(self):
         """Abre un diálogo para seleccionar y cargar el archivo CSV."""
@@ -36,12 +50,8 @@ class AG:
             return None
 
         try:
-            # Especificar dtype para columnas potencialmente problemáticas si es necesario
-            # dtype_dict = {'ColumnaConflictiva': str} # Ejemplo
-            # self.datos_csv = pd.read_csv(file_path, dtype=dtype_dict)
             self.datos_csv = pd.read_csv(file_path)
 
-            # --- Verificación de columnas esenciales ---
             required_cols = ['Cultivo', 'Agua', 'Fertilizante', 'Pesticida', 'Costo',
                              'Produccion', 'EsCultivable', 'CultivoAnterior',
                              'AdaptabilidadClima', 'RetornoEconomico']
@@ -51,23 +61,15 @@ class AG:
                  self.datos_csv = None
                  return None
 
-            # Convertir columnas numéricas, manejando errores
             numeric_cols = ['Agua', 'Fertilizante', 'Pesticida', 'Costo', 'Produccion',
                             'EsCultivable', 'AdaptabilidadClima', 'RetornoEconomico']
             for col in numeric_cols:
                 self.datos_csv[col] = pd.to_numeric(self.datos_csv[col], errors='coerce')
-                # Opcional: Rellenar NaNs si la conversión falla y quieres permitirlo
-                # self.datos_csv[col] = self.datos_csv[col].fillna(0) # O algún otro valor por defecto
 
-            # Comprobar si alguna conversión falló y creó NaNs donde no deberían
             if self.datos_csv[numeric_cols].isnull().any().any():
                  print("Advertencia: Se encontraron valores no numéricos en columnas que deberían serlo. Revise el CSV.")
-                 # Podrías decidir detenerte o continuar, aquí continuamos pero filtramos NaNs en EsCultivable
-                 # messagebox.showwarning("Advertencia", "Se encontraron valores no numéricos en columnas que deberían serlo. Revise el CSV.")
 
-            # --- Filtrado Crucial ---
-            # Asegurarse que EsCultivable sea numérico antes de comparar
-            self.datos_csv = self.datos_csv.dropna(subset=['EsCultivable']) # Eliminar filas donde EsCultivable es NaN
+            self.datos_csv = self.datos_csv.dropna(subset=['EsCultivable'])
             self.datos_csv = self.datos_csv[self.datos_csv["EsCultivable"] == 1].copy()
 
             if self.datos_csv.empty:
@@ -75,243 +77,236 @@ class AG:
                 self.datos_csv = None
                 return None
 
-            print("Datos CSV cargados y filtrados (solo cultivables):")
-            print(self.datos_csv.head()) # Mostrar solo las primeras filas
-            print(f"Número de filas cultivables cargadas: {len(self.datos_csv)}")
+            print(f"Datos CSV cargados y filtrados: {len(self.datos_csv)} cultivos cultivables.")
             print("-" * 30)
 
-            # Calcular máximos del CSV para normalización DESPUÉS de filtrar
-            self.max_agua_csv = self.datos_csv['Agua'].max(skipna=True)
-            self.max_fert_csv = self.datos_csv['Fertilizante'].max(skipna=True)
-            self.max_pest_csv = self.datos_csv['Pesticida'].max(skipna=True)
-            self.max_costo_csv = self.datos_csv['Costo'].max(skipna=True)
-            self.max_prod_csv = self.datos_csv['Produccion'].max(skipna=True)
+            # Calcular máximos del CSV para normalización
+            self.max_agua_csv = max(self.datos_csv['Agua'].max(skipna=True), 1)
+            self.max_fert_csv = max(self.datos_csv['Fertilizante'].max(skipna=True), 1)
+            self.max_pest_csv = max(self.datos_csv['Pesticida'].max(skipna=True), 1)
+            self.max_costo_csv = max(self.datos_csv['Costo'].max(skipna=True), 1)
+            self.max_prod_csv = max(self.datos_csv['Produccion'].max(skipna=True), 1)
+            max_retorno_csv = max(self.datos_csv['RetornoEconomico'].max(skipna=True), 1) # Asumiendo que Retorno es > 0
 
-            self.max_agua_csv = 1 if pd.isna(self.max_agua_csv) else self.max_agua_csv
-            self.max_fert_csv = 1 if pd.isna(self.max_fert_csv) else self.max_fert_csv
-            self.max_pest_csv = 1 if pd.isna(self.max_pest_csv) else self.max_pest_csv
-            self.max_costo_csv = 1 if pd.isna(self.max_costo_csv) else self.max_costo_csv
-            self.max_prod_csv = 1 if pd.isna(self.max_prod_csv) else self.max_prod_csv
-            # Evitar división por cero
-            self.max_agua_csv = max(self.max_agua_csv, 1)
-            self.max_fert_csv = max(self.max_fert_csv, 1)
-            self.max_pest_csv = max(self.max_pest_csv, 1)
-            self.max_costo_csv = max(self.max_costo_csv, 1)
-            self.max_prod_csv = max(self.max_prod_csv, 1)
-
-    
+            # Estimaciones simples para máximos del plan completo (para normalizar aptitud total)
+            # Se pueden refinar estas estimaciones si se tiene más información
+            self.max_retorno_plan_estimado = max_retorno_csv * self.num_parcelas
+            self.max_costo_plan_estimado = self.max_costo_csv * self.num_parcelas
+            self.max_prod_plan_estimado = self.max_prod_csv * self.num_parcelas
 
 
             return self.datos_csv
-        except FileNotFoundError:
-            messagebox.showerror("Error", f"No se encontró el archivo: {file_path}")
-            return None
-        except pd.errors.EmptyDataError:
-             messagebox.showerror("Error", f"El archivo CSV está vacío: {file_path}")
-             return None
-        # Quitamos KeyError porque ya lo verificamos manualmente
-        # except KeyError as e:
-        #      messagebox.showerror("Error", f"Columna requerida no encontrada en el CSV: {e}. Verifica las columnas: {required_cols}")
-        #      return None
         except Exception as e:
             messagebox.showerror("Error", f"Error inesperado al cargar el archivo: {e}")
-            # Imprimir traceback para depuración
             import traceback
             traceback.print_exc()
+            self.datos_csv = None
             return None
 
-    def generar_individuo(self):
-        """Genera un individuo seleccionando una fila aleatoria del CSV y almacenando valores originales."""
+    def _generar_parcela(self):
+        """Genera el diccionario para UNA parcela seleccionando un cultivo aleatorio."""
         if self.datos_csv is None or self.datos_csv.empty:
             raise ValueError("No se han cargado datos válidos del CSV.")
 
         fila = self.datos_csv.sample().iloc[0]
-
         cultivo = fila["Cultivo"]
 
-        # *** Guardar valores ORIGINALES del CSV ***
+        # Valores ORIGINALES del CSV para este cultivo
         original_agua = fila["Agua"]
         original_fertilizante = fila["Fertilizante"]
         original_pesticida = fila["Pesticida"]
         original_costo = fila["Costo"]
         original_produccion = fila["Produccion"]
-        original_retorno = fila["RetornoEconomico"] 
+        original_retorno = fila["RetornoEconomico"]
+        original_adaptabilidad = fila["AdaptabilidadClima"] # Guardar también
 
-        # Crear el diccionario del individuo
-        individuo = {
-            # --- Valores Originales (ancla para evaluación) ---
-            "cultivo_nombre": cultivo, # Identificador clave
+        # Crear el diccionario de la parcela
+        parcela = {
+            "cultivo_nombre": cultivo,
             "original_agua": original_agua,
             "original_fertilizante": original_fertilizante,
             "original_pesticida": original_pesticida,
             "original_costo": original_costo,
             "original_produccion": original_produccion,
             "original_retorno_economico": original_retorno,
-            # --- Valores Mutables (sujetos a evolución) ---
-            # Inicializar con los originales, pero pueden cambiar
+            "original_adaptabilidad_clima": original_adaptabilidad,
+
+            # Valores Mutables (inicializados con los originales)
+            # Estos representan la asignación de recursos A ESTA PARCELA
             "cantidad_agua": original_agua,
             "cantidad_fertilizante": original_fertilizante,
             "cantidad_pesticida": original_pesticida,
-            # --- Otros datos (generalmente fijos o para info) ---
-            # "cultivos": [cultivo] # Cambiado a cultivo_nombre para evitar listas de un solo elemento
-            "aptitud": 0.0 # Inicializar aptitud
         }
-        return individuo
+        return parcela
+
+    def generar_individuo(self):
+        """Genera un individuo (PLAN), que es una lista de parcelas."""
+        if self.datos_csv is None or self.datos_csv.empty:
+             raise ValueError("No se pueden generar individuos sin datos CSV cargados.")
+        if self.num_parcelas <= 0:
+            raise ValueError("El número de parcelas debe ser positivo.")
+
+        plan = [self._generar_parcela() for _ in range(self.num_parcelas)]
+        # La aptitud se calculará para el plan completo más tarde
+        return {"plan": plan, "aptitud": 0.0} # Envolver la lista en un dict con su aptitud
 
     def incializar_poblacion(self):
-        """Crea la población inicial."""
+        """Crea la población inicial de planes."""
         if self.datos_csv is None or self.datos_csv.empty:
              raise ValueError("No se pueden inicializar la población sin datos CSV cargados.")
         poblacion = [self.generar_individuo() for _ in range(self.num_poblacion)]
         return poblacion
 
-    def verificar_rotacion(self, nombre_cultivo_actual):
-        """Verifica si el cultivo actual es diferente al anterior requerido, usando el CSV."""
-        if self.datos_csv is None:
-             return True # No se puede verificar sin datos
+    def verificar_rotacion_secuencial(self, nombre_cultivo_actual, nombre_cultivo_anterior):
+        """
+        Verifica si 'nombre_cultivo_actual' puede seguir a 'nombre_cultivo_anterior'
+        basado en la columna 'CultivoAnterior' del CSV.
+        Asume que 'Ninguno', NaN o vacío significa que no hay restricción desde el anterior.
+        """
+        if self.datos_csv is None or nombre_cultivo_anterior is None:
+             return True # No se puede verificar o es la primera parcela
 
-        # Busca la fila correspondiente al cultivo actual en los datos cargados
-        filas_cultivo = self.datos_csv[self.datos_csv["Cultivo"] == nombre_cultivo_actual]
+        # Busca la fila correspondiente al cultivo ACTUAL en los datos cargados
+        filas_cultivo_actual = self.datos_csv[self.datos_csv["Cultivo"] == nombre_cultivo_actual]
 
-        if filas_cultivo.empty:
-             print(f"Advertencia: Cultivo '{nombre_cultivo_actual}' no encontrado en datos CSV para verificación de rotación.")
+        if filas_cultivo_actual.empty:
+             print(f"Advertencia: Cultivo '{nombre_cultivo_actual}' no encontrado en CSV para verificación de rotación.")
              return False # Considerarlo no válido si no se encuentra
 
-        # Usamos la primera fila encontrada para la regla de rotación de este tipo de cultivo
-        fila = filas_cultivo.iloc[0]
-        cultivo_anterior_requerido = fila["CultivoAnterior"]
+        fila_actual = filas_cultivo_actual.iloc[0]
+        cultivo_anterior_requerido = fila_actual["CultivoAnterior"]
 
-        if pd.isna(cultivo_anterior_requerido) or cultivo_anterior_requerido == "Ninguno" or cultivo_anterior_requerido == "":
-            return True # No hay restricción específica
+        # Interpretar la regla de CultivoAnterior
+        if pd.isna(cultivo_anterior_requerido) or cultivo_anterior_requerido.strip() == "" or cultivo_anterior_requerido == "Ninguno":
+            return True # No hay restricción sobre qué debe venir antes
+        elif cultivo_anterior_requerido == "Diferente":
+             return nombre_cultivo_actual != nombre_cultivo_anterior # Debe ser diferente al anterior inmediato
         else:
-            # La rotación es válida si el cultivo actual NO es igual al requerido como anterior
-            return nombre_cultivo_actual != cultivo_anterior_requerido
+            # Se requiere un cultivo específico como anterior
+            return nombre_cultivo_anterior == cultivo_anterior_requerido
 
-
-    # ... (dentro de la clase AG) ...
 
     def calcular_aptitud(self, individuo):
         """
-        Calcula la aptitud. Combina enfoques:
-        1. La producción depende de la desviación RELATIVA de recursos (respecto a base).
-        2. Se penaliza la desviación ABSOLUTA de recursos (normalizada por disponible).
+        Calcula la aptitud de un individuo (PLAN).
+        Considera el rendimiento/costo total, el uso de recursos globales y la rotación.
         """
-        if self.datos_csv is None or self.datos_csv.empty:
-            raise ValueError("No se pueden calcular aptitudes sin datos CSV cargados.")
+        plan = individuo["plan"] # Extraer la lista de parcelas
+        if not plan: # Si el plan está vacío por alguna razón
+            return 0.0
 
-        cultivo_actual = individuo["cultivo_nombre"]
-        filas_cultivo = self.datos_csv[self.datos_csv["Cultivo"] == cultivo_actual]
+        # --- Sumar recursos y calcular métricas totales del plan ---
+        agua_total_usada = sum(p.get('cantidad_agua', 0) for p in plan)
+        fert_total_usado = sum(p.get('cantidad_fertilizante', 0) for p in plan)
+        pest_total_usado = sum(p.get('cantidad_pesticida', 0) for p in plan)
 
-        if filas_cultivo.empty:
-             print(f"Advertencia: Cultivo '{cultivo_actual}' no encontrado en datos CSV para cálculo de aptitud. Aptitud será 0.")
-             return 0.0
+        produccion_total_ajustada_plan = 0.0
+        costo_total_base_plan = 0.0 # Usando costos base por simplicidad inicial
+        retorno_total_base_plan = 0.0 # Usando retornos base por simplicidad inicial
+        adaptabilidad_promedio_plan = 0.0
+        num_parcelas_validas = 0
 
-        fila_base = filas_cultivo.iloc[0]
+        # --- 1. Penalización por Exceso de Recursos GLOBALES (Hard Constraint) ---
+        if (agua_total_usada > self.total_agua_disponible or
+            fert_total_usado > self.total_fertilizante_disponible or
+            pest_total_usado > self.total_pesticida_disponible):
+            # print(f"Plan descartado por exceso de recursos: A:{agua_total_usada:.1f}/{self.total_agua_disponible} F:{fert_total_usado:.1f}/{self.total_fertilizante_disponible} P:{pest_total_usado:.1f}/{self.total_pesticida_disponible}")
+            return 0.0 # Aptitud cero si se exceden los límites globales
 
-        # --- Obtener valores BASE del CSV (Originales) ---
-        agua_base = fila_base["Agua"]
-        fertilizante_base = fila_base["Fertilizante"]
-        pesticida_base = fila_base["Pesticida"]
-        costo_base = fila_base["Costo"]
-        produccion_base = fila_base["Produccion"] # Producción si se usan recursos base
-        adaptabilidad_clima = fila_base["AdaptabilidadClima"]
-        retorno_economico = fila_base["RetornoEconomico"]
+        # --- 2. Calcular contribución de cada parcela y métricas agregadas ---
+        factor_ajuste_prod_parcela = 1.5 # Cuán sensible es la producción a la desviación (por parcela)
 
-        # --- Obtener valores EVOLUCIONADOS del individuo ---
-        cantidad_agua_ind = individuo["cantidad_agua"]
-        cantidad_fertilizante_ind = individuo["cantidad_fertilizante"]
-        cantidad_pesticida_ind = individuo["cantidad_pesticida"]
+        for parcela in plan:
+            # Obtener valores BASE de la parcela (guardados o buscar en CSV si no)
+            agua_base = parcela.get("original_agua", 0)
+            fert_base = parcela.get("original_fertilizante", 0)
+            pest_base = parcela.get("original_pesticida", 0)
+            prod_base = parcela.get("original_produccion", 0)
+            costo_base = parcela.get("original_costo", 0)
+            retorno_base = parcela.get("original_retorno_economico", 0)
+            adapt_base = parcela.get("original_adaptabilidad_clima", 0)
 
-        # --- INICIO: Modelo de Producción Dependiente de Recursos (Como antes) ---
-        factor_ajuste_prod = 1.0# Puedes ajustar este factor (e.g., 1.0, 1.5, 2.0)
+            # Obtener cantidades asignadas a ESTA parcela
+            agua_ind = parcela.get("cantidad_agua", 0)
+            fert_ind = parcela.get("cantidad_fertilizante", 0)
+            pest_ind = parcela.get("cantidad_pesticida", 0)
 
-        dev_agua_rel = abs(cantidad_agua_ind - agua_base) / agua_base if agua_base > 0 else (0 if cantidad_agua_ind == 0 else float('inf'))
-        dev_fert_rel = abs(cantidad_fertilizante_ind - fertilizante_base) / fertilizante_base if fertilizante_base > 0 else (0 if cantidad_fertilizante_ind == 0 else float('inf'))
-        dev_pest_rel = abs(cantidad_pesticida_ind - pesticida_base) / pesticida_base if pesticida_base > 0 else (0 if cantidad_pesticida_ind == 0 else float('inf'))
+            # Calcular Producción Ajustada para ESTA parcela (similar a antes)
+            dev_agua_rel = abs(agua_ind - agua_base) / agua_base if agua_base > 0 else (0 if agua_ind == 0 else float('inf'))
+            dev_fert_rel = abs(fert_ind - fert_base) / fert_base if fert_base > 0 else (0 if fert_ind == 0 else float('inf'))
+            dev_pest_rel = abs(pest_ind - pest_base) / pest_base if pest_base > 0 else (0 if pest_ind == 0 else float('inf'))
 
-        if float('inf') in [dev_agua_rel, dev_fert_rel, dev_pest_rel]:
-            avg_rel_dev = float('inf')
+            # Evitar división por cero o valores infinitos
+            valid_devs = [d for d in [dev_agua_rel, dev_fert_rel, dev_pest_rel] if d != float('inf')]
+            if not valid_devs: # Si todos son inf o los bases son 0 y las cantidades no
+                 produccion_ajustada_parcela = 0.0
+            else:
+                avg_rel_dev = sum(valid_devs) / len(valid_devs) if valid_devs else 0
+                reduccion_prod = factor_ajuste_prod_parcela * (avg_rel_dev ** 2)
+                produccion_ajustada_parcela = prod_base * max(0.0, 1.0 - reduccion_prod)
+
+            produccion_total_ajustada_plan += produccion_ajustada_parcela
+            costo_total_base_plan += costo_base
+            retorno_total_base_plan += retorno_base # Podríamos ajustar el retorno basado en prod_ajustada? Más complejo. Empezar simple.
+            adaptabilidad_promedio_plan += adapt_base
+            num_parcelas_validas += 1
+
+        if num_parcelas_validas > 0:
+            adaptabilidad_promedio_plan /= num_parcelas_validas
         else:
-            avg_rel_dev = (dev_agua_rel + dev_fert_rel + dev_pest_rel) / 3.0
+             adaptabilidad_promedio_plan = 0 # Evitar división por cero
 
-        if avg_rel_dev == float('inf'):
-             produccion_ajustada = 0.0
-        else:
-             reduccion_prod = factor_ajuste_prod * (avg_rel_dev ** 2)
-             produccion_ajustada = produccion_base * max(0.0, 1.0 - reduccion_prod)
-        # --- FIN: Modelo de Producción Dependiente de Recursos ---
+        # --- 3. Penalización por Rotación (Secuencial) ---
+        factor_penalizacion_rotacion = 0.8 # Multiplicador si falla la rotación (reduce la aptitud)
+        penalizacion_rotacion_acumulada = 1.0
+        for i in range(1, len(plan)):
+            cultivo_actual = plan[i].get('cultivo_nombre')
+            cultivo_anterior = plan[i-1].get('cultivo_nombre')
+            if not self.verificar_rotacion_secuencial(cultivo_actual, cultivo_anterior):
+                penalizacion_rotacion_acumulada *= factor_penalizacion_rotacion
+                # print(f"Penalización rotación: {cultivo_anterior} -> {cultivo_actual}")
 
 
-        # --- Pesos ---
-        peso_produccion = 0.20
-        peso_agua_base = 0.10
-        peso_fertilizante_base = 0.10
-        peso_pesticida_base = 0.10
-        peso_costo_base = 0.10
+        # --- 4. Combinar métricas en Aptitud Final ---
+        # Normalizar métricas totales del plan (usando estimaciones max del plan)
+        prod_norm_plan = produccion_total_ajustada_plan / self.max_prod_plan_estimado if self.max_prod_plan_estimado else 0
+        costo_norm_plan = costo_total_base_plan / self.max_costo_plan_estimado if self.max_costo_plan_estimado else 0
+        retorno_norm_plan = retorno_total_base_plan / self.max_retorno_plan_estimado if self.max_retorno_plan_estimado else 0
+        # Adaptabilidad ya está entre 0 y 1 (asumimos)
+
+        # Definir Pesos para la aptitud del plan
+        peso_produccion = 0.30
+        peso_retorno = 0.40
+        peso_costo = 0.15 # Minimizar costo -> resta
         peso_adaptabilidad = 0.10
-        peso_retorno = 0.20
-        # *** NUEVO/REINTRODUCIDO: Peso para la penalización por desviación ***
-        peso_desviacion_recursos = 0.1 # Ajustar este valor (quizás 0.01, 0.05, 0.1)
-        # *** ELIMINADO: peso_uso_absoluto (ya no se usa en esta versión) ***
-        peso_uso_absoluto = 0.05
+        # Penalización por uso de recursos (queremos favorecer planes más eficientes incluso si no exceden el límite)
+        peso_eficiencia_recursos = 0.05
+        agua_usada_norm = agua_total_usada / self.total_agua_disponible if self.total_agua_disponible else 0
+        fert_usado_norm = fert_total_usado / self.total_fertilizante_disponible if self.total_fertilizante_disponible else 0
+        pest_usado_norm = pest_total_usado / self.total_pesticida_disponible if self.total_pesticida_disponible else 0
+        penalizacion_uso_recursos = (agua_usada_norm + fert_usado_norm + pest_usado_norm) / 3.0
 
-        # --- Normalización para Aptitud Base (Usa Producción Ajustada) ---
-        produccion_norm = produccion_ajustada / self.max_prod_csv
-        agua_norm_base = 1.0 - (agua_base / self.max_agua_csv)
-        fert_norm_base = 1.0 - (fertilizante_base / self.max_fert_csv)
-        pest_norm_base = 1.0 - (pesticida_base / self.max_pest_csv)
-        costo_norm_base = 1.0 - (costo_base / self.max_costo_csv)
-        adaptabilidad_norm = adaptabilidad_clima
-        retorno_norm = retorno_economico
 
-        # --- Cálculo de la aptitud BASE ---
-        aptitud_base = (
-            peso_produccion * produccion_norm +
-            peso_agua_base * agua_norm_base +
-            peso_fertilizante_base * fert_norm_base +
-            peso_pesticida_base * pest_norm_base +
-            peso_costo_base * costo_norm_base +
-            peso_adaptabilidad * adaptabilidad_norm +
-            peso_retorno * retorno_norm
+        aptitud_bruta = (
+            (peso_produccion * prod_norm_plan) +
+            (peso_retorno * retorno_norm_plan) +
+            (peso_adaptabilidad * adaptabilidad_promedio_plan) -
+            (peso_costo * costo_norm_plan) -
+            (peso_eficiencia_recursos * penalizacion_uso_recursos)
         )
 
-        # --- INICIO: Penalización por Desviación (Solución A - Normalizada por Disponible) ---
-        denominador_agua = max(self.cantidad_agua_max, 1)
-        denominador_fert = max(self.cantidad_fertilizante_max, 1)
-        denominador_pest = max(self.cantidad_pesticida_max, 1)
+        # Aplicar penalización por rotación
+        aptitud_con_rotacion = aptitud_bruta * penalizacion_rotacion_acumulada
 
-        # Calcula la desviación absoluta entre evolucionado y base, normalizada por el recurso TOTAL disponible
-        desv_agua_norm_disp = abs(cantidad_agua_ind - agua_base) / denominador_agua
-        desv_fert_norm_disp = abs(cantidad_fertilizante_ind - fertilizante_base) / denominador_fert
-        desv_pest_norm_disp = abs(cantidad_pesticida_ind - pesticida_base) / denominador_pest
+        # Asegurar que la aptitud sea no negativa
+        aptitud_final = max(0.0, aptitud_con_rotacion)
 
-        penalizacion_desviacion = (desv_agua_norm_disp + desv_fert_norm_disp + desv_pest_norm_disp) / 3.0
-        # --- FIN: Penalización por Desviación ---
-        uso_agua_norm = cantidad_agua_ind / denominador_agua
-        uso_fert_norm = cantidad_fertilizante_ind / denominador_fert
-        uso_pest_norm = cantidad_pesticida_ind / denominador_pest
-
-        penalizacion_uso = (uso_agua_norm + uso_fert_norm + uso_pest_norm) / 3.0
-        # --- Penalización por Rotación (como antes) ---
-        penalizacion_rotacion = 1.0
-        aplica_penal_rot = not self.verificar_rotacion(cultivo_actual)
-        if aplica_penal_rot:
-            penalizacion_rotacion = 0.06 # O el valor que prefieras
-
-        # --- Cálculo de la Aptitud Final (usando penalizacion_desviacion) ---
-        aptitud_antes_max = (aptitud_base
-                     - (peso_desviacion_recursos * penalizacion_desviacion)
-                     - (peso_uso_absoluto * penalizacion_uso)
-                    ) * penalizacion_rotacion
-        aptitud_final = max(0.0, aptitud_antes_max)
-
-        # (Puedes volver a añadir prints de DEBUG aquí si lo necesitas)
+        # print(f"Plan: {[p['cultivo_nombre'] for p in plan]} | ProdNorm:{prod_norm_plan:.2f} RetNorm:{retorno_norm_plan:.2f} CostNorm:{costo_norm_plan:.2f} Adap:{adaptabilidad_promedio_plan:.2f} UsoRes:{penalizacion_uso_recursos:.2f} PenRot:{penalizacion_rotacion_acumulada:.2f} -> Aptitud: {aptitud_final:.4f}")
 
         return aptitud_final
 
-# ... (resto de la clase AG sin cambios) ...
     def evaluar_poblacion(self, poblacion):
-        """Calcula y asigna la aptitud a cada individuo de la población."""
+        """Calcula y asigna la aptitud a cada individuo (plan) de la población."""
         for individuo in poblacion:
             # Calcular la aptitud usando la función corregida
             individuo["aptitud"] = self.calcular_aptitud(individuo)
@@ -321,270 +316,267 @@ class AG:
         return poblacion
 
     def seleccion_por_torneo(self, poblacion, tamaño_torneo=3):
-        """Selecciona dos padres usando el método de torneo."""
+        """Selecciona dos padres (planes) usando el método de torneo."""
         n_poblacion = len(poblacion)
         if n_poblacion == 0:
             raise ValueError("La población está vacía, no se puede seleccionar.")
-
-        # Asegurarse de no pedir más individuos de los que hay
         tamaño_real_torneo = min(tamaño_torneo, n_poblacion)
-
-        # Seleccionar índices únicos para cada torneo
         indices1 = np.random.choice(n_poblacion, size=tamaño_real_torneo, replace=False)
         indices2 = np.random.choice(n_poblacion, size=tamaño_real_torneo, replace=False)
-
-        # Obtener los individuos participantes
         torneo1 = [poblacion[i] for i in indices1]
         torneo2 = [poblacion[i] for i in indices2]
-
-        # Elegir al mejor de cada torneo (el que tenga mayor aptitud)
-        # Manejar el caso de aptitudes iguales seleccionando el primero encontrado
         padre1 = max(torneo1, key=lambda ind: ind.get("aptitud", 0.0))
         padre2 = max(torneo2, key=lambda ind: ind.get("aptitud", 0.0))
-
         return padre1, padre2
 
     def cruzar(self, padre1, padre2):
-        """Realiza el cruce entre dos padres."""
-        # Copiar a los padres para crear hijos
-        # Usar deepcopy si los diccionarios fueran más complejos, pero aquí copy() es suficiente
-        hijo1 = padre1.copy()
-        hijo2 = padre2.copy()
+        """Realiza el cruce entre dos padres (planes) usando cruce de un punto en la lista."""
+        # Usar deepcopy porque los individuos contienen listas de diccionarios
+        hijo1_ind = copy.deepcopy(padre1)
+        hijo2_ind = copy.deepcopy(padre2)
+        plan1 = hijo1_ind["plan"]
+        plan2 = hijo2_ind["plan"]
 
-        if np.random.rand() < self.prob_crossover:
-            # Punto de cruce simple: intercambiar uno de los genes MUTABLES
-            genes_mutables = ["cantidad_agua", "cantidad_fertilizante", "cantidad_pesticida"]
-            gen_a_cruzar = np.random.choice(genes_mutables)
+        if np.random.rand() < self.prob_crossover and self.num_parcelas > 1:
+            # Cruce de un punto en la lista de parcelas
+            punto_cruce = np.random.randint(1, self.num_parcelas) # Entre 1 y num_parcelas-1
+            # print(f"Cruce en punto: {punto_cruce}")
+            nuevo_plan1 = plan1[:punto_cruce] + plan2[punto_cruce:]
+            nuevo_plan2 = plan2[:punto_cruce] + plan1[punto_cruce:]
+            hijo1_ind["plan"] = nuevo_plan1
+            hijo2_ind["plan"] = nuevo_plan2
 
-            # Intercambiar el valor del gen mutable seleccionado
-            temp = hijo1[gen_a_cruzar]
-            hijo1[gen_a_cruzar] = hijo2[gen_a_cruzar]
-            hijo2[gen_a_cruzar] = temp
+            # La aptitud de los hijos deberá ser recalculada
+            hijo1_ind['aptitud'] = 0.0
+            hijo2_ind['aptitud'] = 0.0
 
-            # La aptitud de los hijos deberá ser recalculada en la siguiente evaluación
-            hijo1['aptitud'] = 0.0
-            hijo2['aptitud'] = 0.0
+        return hijo1_ind, hijo2_ind
 
-        return hijo1, hijo2
+    def mutar(self, individuo):
+        """Aplica mutación a un individuo (plan). Puede mutar el cultivo o las cantidades en parcelas."""
+        individuo_mutado = copy.deepcopy(individuo) # Necesario por la estructura anidada
+        plan_mutado = individuo_mutado["plan"]
+        reset_aptitud = False
 
-    def mutar(self, individuo, prob_mutar_cultivo=0.05): # Añadir probabilidad de mutar cultivo
-        """Aplica mutación a genes mutables y potencialmente al tipo de cultivo."""
-        individuo_mutado = individuo.copy()
+        for i in range(len(plan_mutado)):
+            parcela_actual = plan_mutado[i]
 
-        # --- Mutación de Cultivo ---
-        if np.random.rand() < prob_mutar_cultivo:
-            if self.datos_csv is not None and not self.datos_csv.empty:
-                # Seleccionar un NUEVO cultivo aleatorio del CSV (diferente al actual)
-                cultivos_disponibles = self.datos_csv['Cultivo'].unique()
-                cultivo_actual = individuo_mutado['cultivo_nombre']
-                # Asegurarse de no elegir el mismo (a menos que solo haya 1 opción)
-                posibles_nuevos = [c for c in cultivos_disponibles if c != cultivo_actual]
-                if posibles_nuevos:
-                    nuevo_cultivo_nombre = np.random.choice(posibles_nuevos)
-                    # Obtener la fila del CSV para el nuevo cultivo
-                    # ¡Importante! Decidir cómo manejar múltiples filas para el mismo cultivo. Usar la primera encontrada es lo más simple.
-                    nueva_fila = self.datos_csv[self.datos_csv['Cultivo'] == nuevo_cultivo_nombre].iloc[0]
+            # --- Mutación de Cultivo en Parcela ---
+            if np.random.rand() < self.prob_mutar_cultivo:
+                if self.datos_csv is not None and not self.datos_csv.empty:
+                    cultivos_disponibles = self.datos_csv['Cultivo'].unique()
+                    cultivo_actual_nombre = parcela_actual['cultivo_nombre']
+                    posibles_nuevos = [c for c in cultivos_disponibles if c != cultivo_actual_nombre]
 
-                    print(f"*** MUTACIÓN DE CULTIVO: {cultivo_actual} -> {nuevo_cultivo_nombre} ***") # Para depuración
+                    if posibles_nuevos:
+                        nuevo_cultivo_nombre = np.random.choice(posibles_nuevos)
+                        nueva_fila = self.datos_csv[self.datos_csv['Cultivo'] == nuevo_cultivo_nombre].iloc[0]
 
-                    # Actualizar TODOS los valores relevantes en el individuo mutado
-                    individuo_mutado['cultivo_nombre'] = nuevo_cultivo_nombre
-                    individuo_mutado['original_agua'] = nueva_fila["Agua"]
-                    individuo_mutado['original_fertilizante'] = nueva_fila["Fertilizante"]
-                    individuo_mutado['original_pesticida'] = nueva_fila["Pesticida"]
-                    individuo_mutado['original_costo'] = nueva_fila["Costo"]
-                    individuo_mutado['original_produccion'] = nueva_fila["Produccion"]
-                    individuo_mutado['original_retorno_economico'] = nueva_fila["RetornoEconomico"]
-                    # Resetear también los mutables a los nuevos originales
-                    individuo_mutado['cantidad_agua'] = nueva_fila["Agua"]
-                    individuo_mutado['cantidad_fertilizante'] = nueva_fila["Fertilizante"]
-                    individuo_mutado['cantidad_pesticida'] = nueva_fila["Pesticida"]
+                        print(f"*** MUTACIÓN CULTIVO en Parcela {i}: {cultivo_actual_nombre} -> {nuevo_cultivo_nombre} ***")
+
+                        # Actualizar TODOS los valores relevantes en ESTA parcela
+                        parcela_actual['cultivo_nombre'] = nuevo_cultivo_nombre
+                        parcela_actual['original_agua'] = nueva_fila["Agua"]
+                        parcela_actual['original_fertilizante'] = nueva_fila["Fertilizante"]
+                        parcela_actual['original_pesticida'] = nueva_fila["Pesticida"]
+                        parcela_actual['original_costo'] = nueva_fila["Costo"]
+                        parcela_actual['original_produccion'] = nueva_fila["Produccion"]
+                        parcela_actual['original_retorno_economico'] = nueva_fila["RetornoEconomico"]
+                        parcela_actual['original_adaptabilidad_clima'] = nueva_fila["AdaptabilidadClima"]
+                        # Resetear también los mutables a los nuevos originales
+                        parcela_actual['cantidad_agua'] = nueva_fila["Agua"]
+                        parcela_actual['cantidad_fertilizante'] = nueva_fila["Fertilizante"]
+                        parcela_actual['cantidad_pesticida'] = nueva_fila["Pesticida"]
+                        reset_aptitud = True
 
 
-        # --- Mutación de Cantidades (como antes) ---
-        # Puede ocurrir independientemente de la mutación de cultivo
-        if np.random.rand() < self.prob_mutacion:
-            individuo_mutado["cantidad_agua"] = np.random.uniform(0, self.cantidad_agua_max)
-            # print(f"Mutacion agua: {individuo['cantidad_agua']} -> {individuo_mutado['cantidad_agua']}") # Debug
+            # --- Mutación de Cantidades en Parcela ---
+            # Definir límites seguros para la mutación de cantidad (ej. 1.5x el máx del CSV para ese recurso?)
+            # O usar los límites globales divididos entre parcelas como guía muy laxa?
+            # Usemos los max del CSV como guía para la escala del cambio.
+            # Podríamos también definir max_mutacion_agua_parcela etc. en __init__
+            max_agua_mut_parcela = self.max_agua_csv * 1.5 # Ejemplo: permitir hasta 150% del max visto
+            max_fert_mut_parcela = self.max_fert_csv * 1.5
+            max_pest_mut_parcela = self.max_pest_csv * 1.5
 
-        if np.random.rand() < self.prob_mutacion:
-            individuo_mutado["cantidad_fertilizante"] = np.random.uniform(0, self.cantidad_fertilizante_max)
-            # print(f"Mutacion fert: {individuo['cantidad_fertilizante']} -> {individuo_mutado['cantidad_fertilizante']}") # Debug
+            if np.random.rand() < self.prob_mutacion_cantidad:
+                 # Mutar cantidad de agua para esta parcela
+                 # Usar una distribución normal centrada en el valor actual? O uniforme?
+                 # Uniforme es más simple por ahora.
+                 cantidad_anterior = parcela_actual["cantidad_agua"]
+                 parcela_actual["cantidad_agua"] = np.random.uniform(0, max_agua_mut_parcela)
+                 # print(f"Mutacion agua parcela {i}: {cantidad_anterior:.1f} -> {parcela_actual['cantidad_agua']:.1f}")
+                 reset_aptitud = True
 
-        if np.random.rand() < self.prob_mutacion:
-             individuo_mutado["cantidad_pesticida"] = np.random.uniform(0, self.cantidad_pesticida_max)
-             # print(f"Mutacion pest: {individuo['cantidad_pesticida']} -> {individuo_mutado['cantidad_pesticida']}") # Debug
+            if np.random.rand() < self.prob_mutacion_cantidad:
+                 cantidad_anterior = parcela_actual["cantidad_fertilizante"]
+                 parcela_actual["cantidad_fertilizante"] = np.random.uniform(0, max_fert_mut_parcela)
+                 # print(f"Mutacion fert parcela {i}: {cantidad_anterior:.1f} -> {parcela_actual['cantidad_fertilizante']:.1f}")
+                 reset_aptitud = True
 
-        # La aptitud deberá ser recalculada en la siguiente evaluación
-        individuo_mutado['aptitud'] = 0.0 # Resetear aptitud tras cualquier mutación
+            if np.random.rand() < self.prob_mutacion_cantidad:
+                 cantidad_anterior = parcela_actual["cantidad_pesticida"]
+                 parcela_actual["cantidad_pesticida"] = np.random.uniform(0, max_pest_mut_parcela)
+                 # print(f"Mutacion pest parcela {i}: {cantidad_anterior:.1f} -> {parcela_actual['cantidad_pesticida']:.1f}")
+                 reset_aptitud = True
+
+        if reset_aptitud:
+            individuo_mutado['aptitud'] = 0.0 # Resetear aptitud si hubo alguna mutación
 
         return individuo_mutado
-    def generar_nueva_poblacion(self, poblacion):
-        """Genera la siguiente población."""
+
+    def generar_nueva_poblacion(self, poblacion_actual):
+        """Genera la siguiente población de planes."""
         nueva_poblacion = []
-        n_poblacion = len(poblacion)
+        n_poblacion = len(poblacion_actual)
+
+        if n_poblacion == 0:
+            return [] # Retornar lista vacía si la población actual está vacía
 
         # Ordenar la población actual por aptitud descendente para elitismo
-        # Usar .get con default 0.0 por si alguna aptitud no se calculó
-        poblacion_ordenada = sorted(poblacion, key=lambda ind: ind.get("aptitud", 0.0), reverse=True)
+        poblacion_ordenada = sorted(poblacion_actual, key=lambda ind: ind.get("aptitud", 0.0), reverse=True)
 
         # 1. Elitismo
         num_elite_real = min(self.num_elite, n_poblacion)
-        nueva_poblacion.extend(poblacion_ordenada[:num_elite_real])
+        # Asegurar que los élite se copian profundamente para evitar modificaciones accidentales
+        for i in range(num_elite_real):
+             nueva_poblacion.append(copy.deepcopy(poblacion_ordenada[i]))
+             # print(f"Elite {i+1}: Aptitud {poblacion_ordenada[i]['aptitud']:.4f}")
+
 
         # 2. Generar el resto usando Selección, Cruce y Mutación
         while len(nueva_poblacion) < self.num_poblacion:
-            if not poblacion: # Chequeo por si la población original era más pequeña que la élite
-                break
             padre1, padre2 = self.seleccion_por_torneo(poblacion_ordenada) # Usar ordenada puede dar ligera ventaja
             hijo1, hijo2 = self.cruzar(padre1, padre2)
             hijo1 = self.mutar(hijo1)
-            hijo2 = self.mutar(hijo2)
+            hijo2 = self.mutar(hijo2) # Mutar ambos hijos
 
             nueva_poblacion.append(hijo1)
-            # Añadir el segundo hijo solo si aún cabe en la población
             if len(nueva_poblacion) < self.num_poblacion:
                 nueva_poblacion.append(hijo2)
 
         return nueva_poblacion
 
-    
+
     def optimizar(self):
-        """Ejecuta el algoritmo genético completo."""
+        """Ejecuta el algoritmo genético completo para encontrar el mejor plan de cultivo."""
         if self.datos_csv is None or self.datos_csv.empty:
              messagebox.showerror("Error", "No se han cargado datos CSV válidos. Ejecuta load_csv() primero.")
              return None
 
-        print("Iniciando optimización con Algoritmo Genético (versión corregida)...")
-        print(f"Parámetros: Población={self.num_poblacion}, Generaciones={self.num_generaciones}, "
-              f"Mutación={self.prob_mutacion}, Cruce={self.prob_crossover}, Elite={self.num_elite}")
-        print(f"Límites max para mutación: Agua={self.cantidad_agua_max}, Fert={self.cantidad_fertilizante_max}, Pest={self.cantidad_pesticida_max}")
-        print("-" * 30)
-
-
-      
+        print("Iniciando optimización del PLAN DE CULTIVO...")
+        print(f"Parámetros: Población={self.num_poblacion}, Generaciones={self.num_generaciones}, Parcelas={self.num_parcelas}")
+        print(f"Probs: Cruce={self.prob_crossover}, Mut.Cantidad={self.prob_mutacion_cantidad}, Mut.Cultivo={self.prob_mutar_cultivo}, Elite={self.num_elite}")
+        print(f"Recursos Totales Disponibles: Agua={self.total_agua_disponible}, Fert={self.total_fertilizante_disponible}, Pest={self.total_pesticida_disponible}")
+        print("-" * 40)
 
         try:
-            # Inicializar población
             poblacion_actual = self.incializar_poblacion()
             self.mejor_aptitud_historial = []
-            num_competidores_a_mostrar = 5 # Cuántos competidores (cultivos únicos) mostrar
+            self.mejor_plan_global = None # Reiniciar el mejor global
+            mejor_aptitud_global = -1.0
 
-            # --- Ciclo evolutivo ---
             for generacion in range(self.num_generaciones):
-                # 1. Evaluar la población actual (calcula aptitud para todos)
+                # 1. Evaluar la población actual
                 poblacion_actual = self.evaluar_poblacion(poblacion_actual)
 
-                # --- Mostrar Información de la Generación ---
                 if not poblacion_actual:
                     print(f"Generación {generacion + 1}/{self.num_generaciones}: ¡Población vacía!")
                     break
 
-                # Ordenar la población evaluada por aptitud para encontrar al mejor y a los competidores
+                # Ordenar para encontrar el mejor de esta generación
                 poblacion_ordenada_evaluada = sorted(poblacion_actual, key=lambda ind: ind.get("aptitud", 0.0), reverse=True)
+                mejor_plan_generacion = poblacion_ordenada_evaluada[0]
+                aptitud_mejor_generacion = mejor_plan_generacion.get("aptitud", 0.0)
+                self.mejor_aptitud_historial.append(aptitud_mejor_generacion if isinstance(aptitud_mejor_generacion, float) else 0.0)
 
-                # a) Mostrar el Mejor Absoluto
-                mejor_de_generacion = poblacion_ordenada_evaluada[0]
-                aptitud_mejor = mejor_de_generacion.get("aptitud", 0.0)
-                self.mejor_aptitud_historial.append(aptitud_mejor if isinstance(aptitud_mejor, (int, float)) else 0.0) # Guardar para gráfica
-
-                if isinstance(aptitud_mejor, (int, float)):
-                     aptitud_str = f"{aptitud_mejor:.4f}"
-                else:
-                     aptitud_str = "N/A"
-                     print(f"Advertencia: Aptitud no numérica encontrada en el mejor de la generación {generacion + 1}")
-
-                print(f"Generación {generacion + 1}/{self.num_generaciones}: "
-                      f"Mejor Aptitud={aptitud_str}, "
-                      f"Cultivo='{mejor_de_generacion.get('cultivo_nombre', 'Desconocido')}'")
-
-                # b) Mostrar los Mejores Competidores (Cultivos Únicos)
-                print(f"  --- Top {num_competidores_a_mostrar} Competidores (Cultivos Únicos en Población) ---")
-                cultivos_mostrados = set()
-                competidores_impresos = 0
-                for individuo in poblacion_ordenada_evaluada:
-                    cultivo = individuo.get('cultivo_nombre', 'Desconocido')
-                    if cultivo not in cultivos_mostrados:
-                        aptitud_competidor = individuo.get('aptitud', 0.0)
-                        if isinstance(aptitud_competidor, (int, float)):
-                             aptitud_comp_str = f"{aptitud_competidor:.4f}"
-                        else:
-                             aptitud_comp_str = "N/A"
-
-                        # Añadir info de rotación para contexto
-                        penalizado_str = ""
-                        if not self.verificar_rotacion(cultivo):
-                            penalizado_str = " (Rot Penal.)"
-
-                        print(f"    - {cultivo:<15}: {aptitud_comp_str}{penalizado_str}")
-
-                        cultivos_mostrados.add(cultivo)
-                        competidores_impresos += 1
-                        if competidores_impresos >= num_competidores_a_mostrar:
-                            break
-                # Si se mostraron menos competidores que los solicitados y hubo más individuos
-                if competidores_impresos < num_competidores_a_mostrar and len(poblacion_ordenada_evaluada) > competidores_impresos:
-                     print("    (No hay más tipos de cultivos únicos en la población actual)")
-                elif competidores_impresos == 0:
-                     print("    (Población vacía o sin individuos válidos)")
+                # Actualizar el mejor plan global encontrado hasta ahora
+                if aptitud_mejor_generacion > mejor_aptitud_global:
+                    mejor_aptitud_global = aptitud_mejor_generacion
+                    self.mejor_plan_global = copy.deepcopy(mejor_plan_generacion) # Guardar copia profunda
+                    print(f"*** Nuevo Mejor Plan Global encontrado en Gen {generacion + 1} - Aptitud: {mejor_aptitud_global:.5f} ***")
 
 
-                # 2. Generar la nueva población para la siguiente iteración
+                # Mostrar info de la generación
+                aptitud_str = f"{aptitud_mejor_generacion:.5f}" if isinstance(aptitud_mejor_generacion, float) else "N/A"
+                print(f"Generación {generacion + 1}/{self.num_generaciones}: Mejor Aptitud={aptitud_str}")
+                # Opcional: Mostrar los cultivos del mejor plan de la generación
+                cultivos_mejor_gen = [p.get('cultivo_nombre', '?') for p in mejor_plan_generacion.get('plan', [])]
+                print(f"  Mejor Plan Gen: {' -> '.join(cultivos_mejor_gen)}")
+
+
+                # 2. Generar la nueva población
                 poblacion_actual = self.generar_nueva_poblacion(poblacion_actual)
+
             # --- Fin del Ciclo Evolutivo ---
 
-
-            # Evaluar la población final una última vez por si acaso
-            poblacion_final = self.evaluar_poblacion(poblacion_actual)
-
-            if not poblacion_final:
-                 print("Optimización finalizada pero la población final está vacía.")
-                 return None
-
-            # Encontrar y retornar el mejor individuo de la población final
-            mejor_individuo_final = max(poblacion_final, key=lambda ind: ind.get("aptitud", 0.0))
-
-            print("-" * 30)
+            print("-" * 40)
             print("Optimización completada.")
-            if mejor_individuo_final: # Asegurarse de que existe
-                print("Detalles del Mejor Individuo Encontrado:")
-                print(f"  Cultivo: {mejor_individuo_final.get('cultivo_nombre', 'Desconocido')}")
-                print(f"  Aptitud Final: {mejor_individuo_final.get('aptitud', 0.0):.4f}")
 
-                print("\n  Valores Originales (del CSV):")
-                # Usamos .get() para evitar errores si alguna clave faltara (aunque no debería)
-                # y formateamos los números para mejor lectura (ej. 2 decimales)
-                original_agua = mejor_individuo_final.get('original_agua', 'N/A')
-                original_fert = mejor_individuo_final.get('original_fertilizante', 'N/A')
-                original_pest = mejor_individuo_final.get('original_pesticida', 'N/A')
-                original_retorno = mejor_individuo_final.get('original_retorno_economico', 'N/A')
-                print(f"    Agua Original:       {original_agua}")
-                print(f"    Fertilizante Original: {original_fert}")
-                print(f"    Pesticida Original:    {original_pest}")
-                print(f"    Retorno Original:     {original_retorno}")
-                print("\n  Cantidades Finales (Evolucionadas):")
-                cantidad_agua = mejor_individuo_final.get('cantidad_agua', 'N/A')
-                cantidad_fert = mejor_individuo_final.get('cantidad_fertilizante', 'N/A')
-                cantidad_pest = mejor_individuo_final.get('cantidad_pesticida', 'N/A')
-                print(f"  Agua Final:       {cantidad_agua}")
-                print(f"  Fertilizante Final: {cantidad_fert}")
-                print(f"  Pesticida Final:    {cantidad_pest}")
+            if self.mejor_plan_global is None:
+                print("No se encontró ningún plan válido durante la optimización.")
+                # Intentar encontrar el mejor de la última población si existe
+                if poblacion_actual:
+                     poblacion_final_evaluada = self.evaluar_poblacion(poblacion_actual)
+                     poblacion_final_ordenada = sorted(poblacion_final_evaluada, key=lambda ind: ind.get("aptitud", 0.0), reverse=True)
+                     if poblacion_final_ordenada and poblacion_final_ordenada[0].get("aptitud", 0.0) > 0:
+                           self.mejor_plan_global = copy.deepcopy(poblacion_final_ordenada[0])
+                           mejor_aptitud_global = self.mejor_plan_global.get("aptitud", 0.0)
+                           print("Usando el mejor plan encontrado en la última generación.")
+                     else:
+                           print("La población final tampoco contenía planes válidos.")
+                           return None
+                else:
+                     return None
 
 
-            # (Grafica opcional, etc...)
+            print("=== Mejor Plan de Cultivo Encontrado ===")
+            print(f"Aptitud Final del Plan: {mejor_aptitud_global:.5f}")
 
-            return mejor_individuo_final
+            agua_total_final = 0
+            fert_total_final = 0
+            pest_total_final = 0
+            costo_total_final = 0
+            retorno_total_final = 0 # Estimado base
 
-        # (Manejo de excepciones como estaba...)
+            plan_final = self.mejor_plan_global.get("plan", [])
+            print("\nDetalles por Parcela:")
+            for i, parcela in enumerate(plan_final):
+                print(f"  --- Parcela {i+1} ---")
+                print(f"    Cultivo:          {parcela.get('cultivo_nombre', 'N/A')}")
+                print(f"    Agua Asignada:    {parcela.get('cantidad_agua', 0):.2f} (Original: {parcela.get('original_agua', 0):.2f})")
+                print(f"    Fertiliz. Asignado: {parcela.get('cantidad_fertilizante', 0):.2f} (Original: {parcela.get('original_fertilizante', 0):.2f})")
+                print(f"    Pesticida Asignado: {parcela.get('cantidad_pesticida', 0):.2f} (Original: {parcela.get('original_pesticida', 0):.2f})")
+                print(f"    Costo Base:       {parcela.get('original_costo', 0):.2f}")
+                print(f"    Retorno Base:     {parcela.get('original_retorno_economico', 0):.2f}")
+                print(f"    Adaptabilidad:    {parcela.get('original_adaptabilidad_clima', 0):.2f}")
+
+                agua_total_final += parcela.get('cantidad_agua', 0)
+                fert_total_final += parcela.get('cantidad_fertilizante', 0)
+                pest_total_final += parcela.get('cantidad_pesticida', 0)
+                costo_total_final += parcela.get('original_costo', 0) # Costo base sumado
+                retorno_total_final += parcela.get('original_retorno_economico', 0) # Retorno base sumado
+
+            print("\nResumen del Plan Completo:")
+            print(f"  Agua Total Usada:        {agua_total_final:.2f} / {self.total_agua_disponible:.2f}")
+            print(f"  Fertilizante Total Usado:{fert_total_final:.2f} / {self.total_fertilizante_disponible:.2f}")
+            print(f"  Pesticida Total Usado:   {pest_total_final:.2f} / {self.total_pesticida_disponible:.2f}")
+            print(f"  Costo Total Estimado:    {costo_total_final:.2f}")
+            print(f"  Retorno Total Estimado:  {retorno_total_final:.2f}")
+
+
+
+
+
+            return self.mejor_plan_global
+
         except ValueError as e:
              print(f"Error durante la optimización: {e}")
              messagebox.showerror("Error de Ejecución", f"Ocurrió un error de valor: {e}")
-             # import traceback # Descomentar para más detalles
-             # traceback.print_exc()
              return None
         except Exception as e:
             print(f"Error inesperado durante la optimización: {e}")
             messagebox.showerror("Error Inesperado", f"Ocurrió un error inesperado: {e}")
             import traceback
-            traceback.print_exc() # Imprime detalles del error
+            traceback.print_exc()
             return None
